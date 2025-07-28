@@ -1,38 +1,47 @@
+import time
 import cv2
 from ultralytics import YOLO
 
-# Scegli il modello: 'yolov8n.pt' (più collaudato) o 'yolov9n.pt' (ancora più preciso)
-model = YOLO("yolov8n.pt")        # sostituisci con "yolov9n.pt" se preferisci
-TARGET = "person"                 # classe COCO da contare
+# Modello
+model = YOLO("yolov8n.pt")
+TARGET = "person"
 
-cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
-         # 0 = webcam; per IP cam usa l'URL RTSP
+# Videocamera (sostituisci indice/backend se serve)
+cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 if not cap.isOpened():
     raise RuntimeError("Impossibile aprire la telecamera")
+
+prev_t = time.perf_counter()       # per il primissimo frame
 
 while True:
     ok, frame = cap.read()
     if not ok:
         break
 
-    # Inference (se hai la GPU, device=0 usa CUDA; -1 forza CPU)
+    # Inference
     results = model.predict(frame, conf=0.4, device="cpu", verbose=False)
-
     dets = results[0].boxes
 
+    # Conta persone
     people = 0
     for box in dets:
-        cls = int(box.cls[0])
-        if model.names[cls] == TARGET:
+        if model.names[int(box.cls[0])] == TARGET:
             people += 1
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    cv2.putText(frame, f"Persone: {people}", (10, 30),
+    # Calcola FPS
+    now = time.perf_counter()
+    fps = 1.0 / (now - prev_t)
+    prev_t = now
+
+    # Overlay testo
+    cv2.putText(frame, f"Persone: {people}  FPS: {fps:.1f}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
+    # Mostra finestra
     cv2.imshow("People Counter", frame)
-    if cv2.waitKey(1) & 0xFF == 27:       # ESC per uscire
+    if cv2.waitKey(1) & 0xFF == 27:   # ESC per uscire
         break
 
 cap.release()
