@@ -1,9 +1,9 @@
 """
 durastream.py – streaming YouTube → MJPEG con YOLOv8
-Fix 2 (2025‑07‑29):
-  • gestisce video con formati DASH/segmented e sceglie il primo MP4 progressivo.
-  • logga i formati se non ne trova di compatibili.
-  • sopprime warning Ultralytics impostando YOLO_CONFIG_DIR=/tmp (già nel Dockerfile).
+Fix 3 (2025‑07‑29):
+  • Supporta stream *video‑only* (acodec=none) così OpenCV legge anche formati DASH.
+  • Logga comunque i primi 5 formati in caso di fallimento.
+  • Variabile d’ambiente facoltativa YT_FORMAT per override manuale.
 """
 
 import os
@@ -19,52 +19,42 @@ TARGET = "person"
 MODEL_PATH = "yolov8n.pt"
 CONF_THRES = 0.4
 VIDEO_URL = os.getenv("VIDEO_URL", "https://www.youtube.com/watch?v=Z49UkOi08DE")
+YT_FORMAT = os.getenv("YT_FORMAT", "best[ext=mp4][height<=720]/best")
 
-# Inibisci i warning Ultralytics (cartella non scrivibile)
-os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")  # sopprime warning Ultralytics
 
 
 def pick_stream_url(info: dict) -> str | None:
-    """Ritorna un URL riproducibile da OpenCV (HTTPS, audio+video MP4)."""
-    # 1️⃣ Alcune versioni yt-dlp restituiscono url diretto
+    """Ritorna un URL HTTPS MP4 leggibile da OpenCV.
+    Non serve audio: accetta acodec=='none'.
+    """
     if "url" in info and info.get("ext") == "mp4":
         return info["url"]
 
-    # 2️⃣ Scorri i formati e scegli MP4 progressivo ≤720p (acodec+vcodec non 'none')
     fmts = info.get("formats", [])
-    progressive = [
+    mp4_fmts = [
         f for f in fmts
-        if f.get("ext") == "mp4"
-        and f.get("acodec") != "none"
-        and f.get("vcodec") != "none"
-        and f.get("protocol", "").startswith("https")
+        if f.get("ext") == "mp4" and f.get("vcodec") != "none" and f.get("protocol", "").startswith("https")
     ]
-    if progressive:
-        # pick the one with the highest resolution up to 720p
-        progressive.sort(key=lambda f: f.get("height", 0), reverse=True)
-        return progressive[0]["url"]
+    if mp4_fmts:
+        mp4_fmts.sort(key=lambda f: f.get("height", 0), reverse=True)
+        return mp4_fmts[0]["url"]
 
-    # 3️⃣ Fallback: qualsiasi formato con chiave 'url'
+    # fallback qualsiasi formato HTTPS video-only
     for f in fmts:
-        if f.get("url"):
+        if f.get("url") and f.get("vcodec") != "none":
             return f["url"]
     return None
 
 
 def cap_from_youtube(url: str) -> cv2.VideoCapture:
-    """Ritorna un VideoCapture o solleva RuntimeError se fallisce."""
-    ydl_opts = {
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
-        "quiet": True,
-        "noplaylist": True,
-    }
+    ydl_opts = {"format": YT_FORMAT, "quiet": True, "noplaylist": True}
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         stream_url = pick_stream_url(info)
         if not stream_url:
-            # Log formati disponibili per debug
-            sys.stderr.write("[durastream] Nessun formato MP4 progressivo trovato. Formati disponibili:\n")
-            sys.stderr.write(json.dumps(info.get("formats", [])[:10], indent=2) + "\n")
+            sys.stderr.write("[durastream] Nessun formato MP4/DASH compatibile. Prime 5 entry formats:\n")
+            sys.stderr.write(json.dumps(info.get("formats", [])[:5], indent=2) + "\n")
             raise RuntimeError("Nessun formato video compatibile trovato per la URL fornita")
 
     cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
@@ -107,8 +97,7 @@ def frame_generator():
         ret, buf = cv2.imencode(".jpg", frame)
         if not ret:
             continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" +
-               buf.tobytes() + b"\r\n")
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
 
 
 @app.route("/")
@@ -125,8 +114,7 @@ def index():
 @app.route("/video")
 
 def video_feed():
-    return Response(frame_generator(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(frame_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 if __name__ == "__main__":
