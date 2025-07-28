@@ -1,10 +1,15 @@
 """
 durastream.py – streaming YouTube → MJPEG con YOLOv8
-Fix: gestione KeyError 'url' (yt‑dlp 2024+) e noplaylist.
+Fix 2 (2025‑07‑29):
+  • gestisce video con formati DASH/segmented e sceglie il primo MP4 progressivo.
+  • logga i formati se non ne trova di compatibili.
+  • sopprime warning Ultralytics impostando YOLO_CONFIG_DIR=/tmp (già nel Dockerfile).
 """
 
 import os
+import sys
 import time
+import json
 import cv2
 from flask import Flask, Response, render_template_string
 from ultralytics import YOLO
@@ -15,29 +20,52 @@ MODEL_PATH = "yolov8n.pt"
 CONF_THRES = 0.4
 VIDEO_URL = os.getenv("VIDEO_URL", "https://www.youtube.com/watch?v=Z49UkOi08DE")
 
+# Inibisci i warning Ultralytics (cartella non scrivibile)
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")
 
-def cap_from_youtube(url: str, quality: str = "best[height<=720]") -> cv2.VideoCapture:
-    """Restituisce un VideoCapture a partire da un link YouTube.
 
-    yt‑dlp >=2024 non sempre include la chiave 'url' top‑level;
-    la ricaviamo dal formato scelto.
-    """
+def pick_stream_url(info: dict) -> str | None:
+    """Ritorna un URL riproducibile da OpenCV (HTTPS, audio+video MP4)."""
+    # 1️⃣ Alcune versioni yt-dlp restituiscono url diretto
+    if "url" in info and info.get("ext") == "mp4":
+        return info["url"]
+
+    # 2️⃣ Scorri i formati e scegli MP4 progressivo ≤720p (acodec+vcodec non 'none')
+    fmts = info.get("formats", [])
+    progressive = [
+        f for f in fmts
+        if f.get("ext") == "mp4"
+        and f.get("acodec") != "none"
+        and f.get("vcodec") != "none"
+        and f.get("protocol", "").startswith("https")
+    ]
+    if progressive:
+        # pick the one with the highest resolution up to 720p
+        progressive.sort(key=lambda f: f.get("height", 0), reverse=True)
+        return progressive[0]["url"]
+
+    # 3️⃣ Fallback: qualsiasi formato con chiave 'url'
+    for f in fmts:
+        if f.get("url"):
+            return f["url"]
+    return None
+
+
+def cap_from_youtube(url: str) -> cv2.VideoCapture:
+    """Ritorna un VideoCapture o solleva RuntimeError se fallisce."""
     ydl_opts = {
-        "format": quality,
+        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
         "quiet": True,
-        "noplaylist": True,  # evita di trattare l'URL come playlist
+        "noplaylist": True,
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        # Caso 1: extractor restituisce url diretto (alcune versioni / scenari)
-        if "url" in info:
-            stream_url = info["url"]
-        else:
-            # Caso 2: scegliere il primo formato con protocollo HTTPS
-            fmts = info.get("formats")
-            if not fmts:
-                raise RuntimeError("Nessun formato video disponibile per la URL fornita")
-            stream_url = next((f["url"] for f in fmts if f.get("url")), fmts[0]["url"])
+        stream_url = pick_stream_url(info)
+        if not stream_url:
+            # Log formati disponibili per debug
+            sys.stderr.write("[durastream] Nessun formato MP4 progressivo trovato. Formati disponibili:\n")
+            sys.stderr.write(json.dumps(info.get("formats", [])[:10], indent=2) + "\n")
+            raise RuntimeError("Nessun formato video compatibile trovato per la URL fornita")
 
     cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
@@ -84,6 +112,7 @@ def frame_generator():
 
 
 @app.route("/")
+
 def index():
     return render_template_string("""
 <!doctype html>
@@ -94,6 +123,7 @@ def index():
 
 
 @app.route("/video")
+
 def video_feed():
     return Response(frame_generator(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
