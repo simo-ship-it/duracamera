@@ -31,4 +31,4 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          tags: simonebilleri/people-counter:latest
+          tags: simo-ship-it/duracamera:latest

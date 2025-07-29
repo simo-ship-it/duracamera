@@ -1,34 +1,27 @@
-name: Build and Push to Docker Hub
+# ---------- Base ----------
+FROM python:3.11-slim
 
-on:
-  push:
-    branches: [ main ]
-    paths:
-      - Dockerfile
-      - durastream.py
-      - .github/workflows/build.yml
+ENV PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+# ---------- Dipendenze di sistema ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libgl1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    python -m venv "$VIRTUAL_ENV" && \
+    $VIRTUAL_ENV/bin/pip install --no-cache-dir --upgrade pip
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+# ---------- Librerie Python ----------
+RUN pip install --no-cache-dir ultralytics opencv-python-headless \
+                                 yt-dlp flask
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+# ---------- App ----------
+WORKDIR /app
+COPY durastream.py .
 
-      - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64
-          tags: simonebilleri/people-counter:latest
+ENV VIDEO_URL="https://www.youtube.com/watch?v=Z49UkOi08DE"
+EXPOSE 8000
+
+ENTRYPOINT ["python", "durastream.py"]

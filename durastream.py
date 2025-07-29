@@ -1,54 +1,69 @@
 """
-durastream.py – People Counter (YOLOv8/YOLOv10) da MJPEG IP-Camera
-=================================================================
-• /              → pagina HTML che incorpora lo stream
-• /video         → MJPEG live con bounding-box
-• /api/count     → JSON {people, fps, ts}
+durastream.py – YOLOv10 + MJPEG API
+-----------------------------------
+• /video        → stream MJPEG con riquadri persone
+• /api/count    → JSON {people, fps, ts}
 
-▶ Config via variabili d’ambiente
-   VIDEO_URL    : URL MJPEG (default Axis demo cam)
-   YOLO_MODEL   : /app/models/yolov10s.pt  (puoi mettere yolov8n.pt ecc.)
-   YOLO_DEVICE  : cpu  | cuda
-   CONF         : soglia confidenza (0.4)
+▶ CONFIGURAZIONE
+   YOLO_MODEL   = yolov10s.pt   # default (puoi usare yolov10m.pt, l, x…)
+   YOLO_DEVICE  = cpu           # o "cuda" se il container vede la GPU
+   CONF         = 0.4           # soglia confidenza
+   VIDEO_URL    = link YouTube
+   YT_FORMAT    = stringa yt-dlp (facoltativa)
 
-Il Dockerfile pre-scarica i pesi yolov10s.pt e yolov8n.pt dentro /app/models.
+Dipendenze: ultralytics>=8.2.90, opencv-python-headless, yt-dlp, flask
 """
 
 from __future__ import annotations
-import os
-import time
+import os, sys, time, json
 import cv2
 from flask import Flask, Response, jsonify, render_template_string
 from ultralytics import YOLO
+from yt_dlp import YoutubeDL
 
-# ──────────────────────────────────────────────
-# Configurazione da ENV
-# ──────────────────────────────────────────────
+# --------- Env config ---------
 TARGET       = "person"
-VIDEO_URL    = os.getenv("VIDEO_URL", "http://85.196.146.82:3337/axis-cgi/mjpg/video.cgi")
-YOLO_MODEL   = os.getenv("YOLO_MODEL", "/app/models/yolov10s.pt")  # path nel container
+YOLO_MODEL   = os.getenv("YOLO_MODEL", "yolov10s.pt")
 YOLO_DEVICE  = os.getenv("YOLO_DEVICE", "cpu")
 CONF_THRES   = float(os.getenv("CONF", 0.4))
+VIDEO_URL    = os.getenv("VIDEO_URL", "https://www.youtube.com/watch?v=Z49UkOi08DE")
+YT_FORMAT    = os.getenv("YT_FORMAT", "best[ext=mp4][height<=720]/best")
 
-# Sopprime warning Ultralytics (cartella non scrivibile)
-os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/ultralytics")
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")  # sopprime warning Ultralytics
 
-# ──────────────────────────────────────────────
-# Inizializzazione
-# ──────────────────────────────────────────────
+# --------- Helper YouTube ---------
+
+def _pick_stream_url(info: dict) -> str | None:
+    """Seleziona un URL video HTTPS MP4 o DASH leggibile da OpenCV."""
+    if info.get("url") and info.get("ext") == "mp4":
+        return info["url"]
+    fmts = [f for f in info.get("formats", []) if f.get("vcodec") != "none" and f.get("protocol", "").startswith("https")]
+    fmts.sort(key=lambda f: f.get("height", 0), reverse=True)
+    return fmts[0]["url"] if fmts else None
+
+
+def cap_from_youtube(url: str) -> cv2.VideoCapture:
+    with YoutubeDL({"format": YT_FORMAT, "quiet": True, "noplaylist": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+        stream_url = _pick_stream_url(info)
+        if not stream_url:
+            sys.stderr.write("[durastream] Nessun formato video compatibile. Dump<=5 formats:\n" +
+                             json.dumps(info.get("formats", [])[:5], indent=2) + "\n")
+            raise RuntimeError("Nessun formato video compatibile per la URL fornita")
+    cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        raise RuntimeError("Impossibile aprire lo stream video")
+    return cap
+
+# --------- YOLO init ---------
 model = YOLO(YOLO_MODEL, task="detect")
-cap   = cv2.VideoCapture(VIDEO_URL)
-if not cap.isOpened():
-    raise RuntimeError(f"Impossibile aprire lo stream: {VIDEO_URL}")
-
+cap   = cap_from_youtube(VIDEO_URL)
 prev_t = time.perf_counter()
 last_people = 0
-last_fps    = 0.0
-last_ts     = time.time()
+last_fps = 0.0
+last_ts = time.time()
 
-# ──────────────────────────────────────────────
-# Flask App
-# ──────────────────────────────────────────────
+# --------- Flask app ---------
 app = Flask(__name__)
 
 
@@ -57,9 +72,8 @@ def frame_generator():
     while True:
         ok, frame = cap.read()
         if not ok:
-            break  # stream interrotto
+            break
 
-        # YOLO inference
         results = model.predict(frame, conf=CONF_THRES, device=YOLO_DEVICE, verbose=False)
         dets = results[0].boxes
 
@@ -70,30 +84,26 @@ def frame_generator():
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        # FPS
         now = time.perf_counter()
         fps = 1.0 / (now - prev_t)
         prev_t = now
-
-        # Stato globale per API
         last_people, last_fps, last_ts = people, fps, time.time()
 
-        # Overlay testo
         cv2.putText(frame, f"Persone: {people}  FPS: {fps:.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        # Codifica JPEG
         ret, buf = cv2.imencode(".jpg", frame)
         if not ret:
             continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
 
 
 @app.route("/")
+
 def index():
     return render_template_string("""
 <!doctype html>
-<title>People Counter</title>
+<title>duracamera v10</title>
 <style>body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh}</style>
 <img src="{{ url_for('video_feed') }}" style="max-width:100%;height:auto">
 """)
