@@ -21,7 +21,7 @@ from ultralytics import YOLO
 
 # --------- Env config ---------
 TARGET       = "person"
-YOLO_MODEL   = os.getenv("YOLO_MODEL", "yolov10s.pt")
+YOLO_MODEL   = os.getenv("YOLO_MODEL", "yolov8n.pt")
 YOLO_DEVICE  = os.getenv("YOLO_DEVICE", "cpu")
 CONF_THRES   = float(os.getenv("CONF", 0.4))
 VIDEO_URL    = os.getenv("VIDEO_URL", "http://85.196.146.82:3337/axis-cgi/mjpg/video.cgi")
