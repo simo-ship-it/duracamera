@@ -1,84 +1,80 @@
 """
-durastream.py – streaming YouTube → MJPEG con YOLOv8
-Fix 3 (2025‑07‑29):
-  • Supporta stream *video‑only* (acodec=none) così OpenCV legge anche formati DASH.
-  • Logga comunque i primi 5 formati in caso di fallimento.
-  • Variabile d’ambiente facoltativa YT_FORMAT per override manuale.
+durastream.py – YOLOv10 + MJPEG API
+-----------------------------------
+• /video        → stream MJPEG con riquadri persone
+• /api/count    → JSON {people, fps, ts}
+
+▶ CONFIGURAZIONE
+   YOLO_MODEL   = yolov10s.pt   # default (puoi usare yolov10m.pt, l, x…)
+   YOLO_DEVICE  = cpu           # o "cuda" se il container vede la GPU
+   CONF         = 0.4           # soglia confidenza
+   VIDEO_URL    = link YouTube
+   YT_FORMAT    = stringa yt-dlp (facoltativa)
+
+Dipendenze: ultralytics>=8.2.90, opencv-python-headless, yt-dlp, flask
 """
 
-import os
-import sys
-import time
-import json
+from __future__ import annotations
+import os, sys, time, json
 import cv2
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, jsonify, render_template_string
 from ultralytics import YOLO
 from yt_dlp import YoutubeDL
 
-TARGET = "person"
-MODEL_PATH = "yolov8n.pt"
-CONF_THRES = 0.4
-VIDEO_URL = os.getenv("VIDEO_URL", "https://www.youtube.com/watch?v=Z49UkOi08DE")
-YT_FORMAT = os.getenv("YT_FORMAT", "best[ext=mp4][height<=720]/best")
+# --------- Env config ---------
+TARGET       = "person"
+YOLO_MODEL   = os.getenv("YOLO_MODEL", "yolov10s.pt")
+YOLO_DEVICE  = os.getenv("YOLO_DEVICE", "cpu")
+CONF_THRES   = float(os.getenv("CONF", 0.4))
+VIDEO_URL    = os.getenv("VIDEO_URL", "https://www.youtube.com/watch?v=Z49UkOi08DE")
+YT_FORMAT    = os.getenv("YT_FORMAT", "best[ext=mp4][height<=720]/best")
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")  # sopprime warning Ultralytics
 
+# --------- Helper YouTube ---------
 
-def pick_stream_url(info: dict) -> str | None:
-    """Ritorna un URL HTTPS MP4 leggibile da OpenCV.
-    Non serve audio: accetta acodec=='none'.
-    """
-    if "url" in info and info.get("ext") == "mp4":
+def _pick_stream_url(info: dict) -> str | None:
+    """Seleziona un URL video HTTPS MP4 o DASH leggibile da OpenCV."""
+    if info.get("url") and info.get("ext") == "mp4":
         return info["url"]
-
-    fmts = info.get("formats", [])
-    mp4_fmts = [
-        f for f in fmts
-        if f.get("ext") == "mp4" and f.get("vcodec") != "none" and f.get("protocol", "").startswith("https")
-    ]
-    if mp4_fmts:
-        mp4_fmts.sort(key=lambda f: f.get("height", 0), reverse=True)
-        return mp4_fmts[0]["url"]
-
-    # fallback qualsiasi formato HTTPS video-only
-    for f in fmts:
-        if f.get("url") and f.get("vcodec") != "none":
-            return f["url"]
-    return None
+    fmts = [f for f in info.get("formats", []) if f.get("vcodec") != "none" and f.get("protocol", "").startswith("https")]
+    fmts.sort(key=lambda f: f.get("height", 0), reverse=True)
+    return fmts[0]["url"] if fmts else None
 
 
 def cap_from_youtube(url: str) -> cv2.VideoCapture:
-    ydl_opts = {"format": YT_FORMAT, "quiet": True, "noplaylist": True}
-    with YoutubeDL(ydl_opts) as ydl:
+    with YoutubeDL({"format": YT_FORMAT, "quiet": True, "noplaylist": True}) as ydl:
         info = ydl.extract_info(url, download=False)
-        stream_url = pick_stream_url(info)
+        stream_url = _pick_stream_url(info)
         if not stream_url:
-            sys.stderr.write("[durastream] Nessun formato MP4/DASH compatibile. Prime 5 entry formats:\n")
-            sys.stderr.write(json.dumps(info.get("formats", [])[:5], indent=2) + "\n")
-            raise RuntimeError("Nessun formato video compatibile trovato per la URL fornita")
-
+            sys.stderr.write("[durastream] Nessun formato video compatibile. Dump<=5 formats:\n" +
+                             json.dumps(info.get("formats", [])[:5], indent=2) + "\n")
+            raise RuntimeError("Nessun formato video compatibile per la URL fornita")
     cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         raise RuntimeError("Impossibile aprire lo stream video")
     return cap
 
-
-# --------------------- YOLO & Flask ---------------------
-model = YOLO(MODEL_PATH)
-cap = cap_from_youtube(VIDEO_URL)
+# --------- YOLO init ---------
+model = YOLO(YOLO_MODEL, task="detect")
+cap   = cap_from_youtube(VIDEO_URL)
 prev_t = time.perf_counter()
+last_people = 0
+last_fps = 0.0
+last_ts = time.time()
 
+# --------- Flask app ---------
 app = Flask(__name__)
 
 
 def frame_generator():
-    global prev_t
+    global prev_t, last_people, last_fps, last_ts
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        results = model.predict(frame, conf=CONF_THRES, device="cpu", verbose=False)
+        results = model.predict(frame, conf=CONF_THRES, device=YOLO_DEVICE, verbose=False)
         dets = results[0].boxes
 
         people = 0
@@ -91,13 +87,15 @@ def frame_generator():
         now = time.perf_counter()
         fps = 1.0 / (now - prev_t)
         prev_t = now
+        last_people, last_fps, last_ts = people, fps, time.time()
+
         cv2.putText(frame, f"Persone: {people}  FPS: {fps:.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
         ret, buf = cv2.imencode(".jpg", frame)
         if not ret:
             continue
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
 
 
 @app.route("/")
@@ -105,7 +103,7 @@ def frame_generator():
 def index():
     return render_template_string("""
 <!doctype html>
-<title>duracamera</title>
+<title>duracamera v10</title>
 <style>body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh}</style>
 <img src="{{ url_for('video_feed') }}" style="max-width:100%;height:auto">
 """)
@@ -117,6 +115,11 @@ def video_feed():
     return Response(frame_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.route("/api/count")
+
+def api_count():
+    return jsonify(people=last_people, fps=round(last_fps, 2), ts=int(last_ts))
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)), threaded=True)
-#programma funzionante numero 1
